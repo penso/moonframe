@@ -936,6 +936,13 @@ type TerminalProps = {
 	-- Sent once, with `exited = true` added, as the shell exits (Ctrl-D,
 	-- `exit`). Without it the terminal says so and Enter starts another.
 	exit: Data?,
+	-- Sent, to this mod only, as the shell reports something, with `event`
+	-- added: "prompt", "started" (`command?`), "finished" (`command?`,
+	-- `status?`, `took_ms`), "folder" (`path`, `host?`), "title" (`title`)
+	-- or "notice" (`title?`, `body`). A table is added to; anything else
+	-- arrives as `msg`. Any program can print these, so show them, and
+	-- never act on them.
+	shell: Data?,
 	[number]: string,
 }
 
@@ -1305,6 +1312,19 @@ declare ui: {
 	memo: <T>(key: string, deps: { any }, build: () -> T) -> T,
 }
 
+-- One commit of `app.git.log`.
+type GitCommit = {
+	sha: string,
+	short: string,
+	parents: { string },
+	author: string,
+	-- Seconds since 1970.
+	time: number,
+	-- Branches and tags pointing here.
+	refs: { string },
+	subject: string,
+}
+
 -- This machine's load, sampled by the host once a second.
 type System = {
 	-- Fractions from 0 to 1.
@@ -1514,6 +1534,9 @@ type Git = {
 	branches: { GitBranch },
 	remote: GitRemote?,
 	stashes: number,
+	-- Once a mod sends `provider:git` `{ log = 200 }`: recent commits of every
+	-- branch, tag and HEAD, children before parents.
+	log: { GitCommit }?,
 	-- The file asked for with `{ diff = path }`, until `{ diff = false }`.
 	diff: GitDiff?,
 }

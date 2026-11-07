@@ -395,6 +395,26 @@ live shell. The host runs it, so it can't be written in Luau:
   pty that ends with the app. `"herdr-core"`, `"tmux"` or `"pty"` asks for
   one; one that is missing falls back to the next. A faint label in the
   terminal's bottom-right corner names the backend in use.
+- **What the shell does:** `shell = <msg>` sends the mod that message, with
+  `event` added, as things happen: `"prompt"`, `"started"` (`command?`),
+  `"finished"` (`command?`, `status?`, `took_ms`), `"folder"` (`path`,
+  `host?`, which names the other machine in an `ssh` session), `"title"`
+  (`title`), `"notice"` (`title?`, `body`: a program asking to tell the user
+  something, as agents do when they wait). Only the mod that asked hears it,
+  since a command line can hold a secret. Any program can print these
+  sequences, even `cat` of a file: show them or notify, and never run
+  anything because of one. zsh and fish report commands and folders by
+  themselves; bash needs `[ -n "$MOONFRAME_SHELL_INTEGRATION" ] && .
+  "$MOONFRAME_SHELL_INTEGRATION/moonframe.bash"` in `~/.bashrc`, and 4.4 or
+  later to report commands (macOS's own 3.2 reports only its folder).
+  `MOONFRAME_SHELL_INTEGRATION=0` in the app's environment turns it off, and
+  shells already running under herdr-core or tmux get it once restarted. A
+  tab from `tabbed` uses this itself: it takes its shell's folder or title
+  as its name, and posts a notification for a notice, or for a command of
+  10 s or more ending in a tab not on show. A tab not on show has a spinner
+  while a command runs, and a dot once a program needs the user or a command
+  ended, until it is shown. An agent reaches that dot by printing a notice
+  (OSC 9 or 777).
 - **Engines:** `engine = "alacritty"` (default, pure Rust) or `"ghostty"`
   (libghostty-vt). Both are cargo features of the `moonframe` crate; the
   starter builds both, an app on the library opts into `ghostty`.
@@ -1862,6 +1882,16 @@ it: the repository follows the terminal, so one that moved (or no `root`)
 is refused, never written to another. Signing and pushing may wait on the user's hardware key: show
 that something runs until the reply comes.
 
+Worktrees, one per branch in flight, take the same `root`, `id` and
+`writers`. `{ worktree_add = { branch = "feat/x", base = "main" }, root = ...,
+id = ... }` checks out `branch`, making it from `base` (or HEAD) when it is
+new, and the reply's `message` is the folder: the host picks it, beside the
+repository in `<repository>.worktrees/<branch>`, never a mod. `{
+worktree_remove = <path from app.git.worktrees>, root = ..., id = ... }`
+removes a linked worktree. The branch stays, and it is refused with
+uncommitted changes, for the main checkout, or for the checkout in use; there
+is no way to force it, so show `error` to the user, who decides.
+
 | field | shape |
 |---|---|
 | `repository`, `branch`, `changed`, `ahead`, `behind` | as before; `branch` is `"HEAD"` when `detached` |
@@ -1873,6 +1903,7 @@ that something runs until the reply comes.
 | `branches` | 20 newest local `{ name, head, time, upstream?, ahead, behind, gone, current }` |
 | `remote` | `{ name, url, host, kind ("github" "gitlab" "other"), owner, repo, web_url? }` or nil |
 | `stashes` | count |
+| `log` | once a mod sends `{ log = 200 }` (at most 500; `false` stops it): `{ sha, short, parents, author, time, refs, subject }`, children before parents, of every branch, tag and HEAD. Draw it with `use "commit-graph"`; the `history` mod is a tab that does |
 | `diff` | `{ path, binary, lines, truncated, hunks = { { header, old_start, new_start, lines = { { kind ("add" "del" "ctx"), old?, new?, text } } } } }`, at most 1200 lines of 300 characters |
 
 `app.docs` (docs, native): `{ available, root }`, the root `app.files`

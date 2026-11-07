@@ -33,8 +33,10 @@
 //! name when the mod gave no `id`.
 
 mod diff;
+mod log;
 mod refs;
 mod status;
+mod worktrees;
 
 /// A remote URL's host, owner and repository, as `app.git.remote` gives
 /// them; the forge providers read their repository with it.
@@ -57,6 +59,7 @@ use {
         thread,
         time::{Duration, Instant},
     },
+    worktrees::Change,
 };
 
 /// How long a read may take; writes get herdr-vcs's own, longer deadline.
@@ -153,6 +156,12 @@ pub struct Git {
     status: Status,
     head: Value,
     worktrees: Vec<refs::Worktree>,
+    /// How many commits a mod asked to see, and those read.
+    log_limit: Option<usize>,
+    log: Vec<Value>,
+    /// How many times the log was read.
+    #[cfg(test)]
+    log_reads: usize,
     branches: Vec<Value>,
     remote: Value,
     stashes: u64,
@@ -211,14 +220,50 @@ impl Native for Git {
             Some(Data::Bool(false) | Data::Nil) => self.diff_path = None,
             _ => {},
         }
+        match field("log") {
+            Some(Data::Integer(count)) => {
+                let limit = usize::try_from(*count)
+                    .unwrap_or(log::MAX_COMMITS)
+                    .clamp(1, log::MAX_COMMITS);
+                // Read at once only for a new request: a mod sending this
+                // each frame must not get past the pace of `look`.
+                if self.log_limit != Some(limit) {
+                    self.log_limit = Some(limit);
+                    self.read_log();
+                }
+            },
+            Some(Data::Bool(false)) => {
+                self.log_limit = None;
+                self.log.clear();
+            },
+            _ => {},
+        }
         let root = match field("root") {
             Some(Data::String(root)) => Some(root.as_str()),
             _ => None,
         };
         if let Some(Data::String(text)) = field("commit") {
-            self.act(host, from, field("id"), root, Action::Commit(text.clone()));
+            self.act(
+                host,
+                from,
+                field("id"),
+                root,
+                Job::Vcs(Action::Commit(text.clone())),
+            );
         } else if let Some(Data::Bool(true)) = field("push") {
-            self.act(host, from, field("id"), root, Action::Push);
+            self.act(host, from, field("id"), root, Job::Vcs(Action::Push));
+        } else if let Some(asked) = field("worktree_add") {
+            let job = Change::add(asked).map(Job::Worktree);
+            self.act_or_refuse(host, from, field("id"), root, job, "worktree_add");
+        } else if let Some(Data::String(path)) = field("worktree_remove") {
+            let path = path.clone();
+            self.act(
+                host,
+                from,
+                field("id"),
+                root,
+                Job::Worktree(Change::Remove { path }),
+            );
         }
         // Worktrees, branches, remote and stashes are some 60 git commands
         // with many worktrees: a mod sending a message each frame gets them
@@ -235,6 +280,17 @@ impl Native for Git {
 }
 
 impl Git {
+    /// Reads the commits a mod asked for; nothing if none did.
+    fn read_log(&mut self) {
+        if let (Some(limit), Some(root)) = (self.log_limit, &self.root) {
+            self.log = log::commits(&Repo::at(root), limit);
+            #[cfg(test)]
+            {
+                self.log_reads += 1;
+            }
+        }
+    }
+
     /// Moves to `project`, the project the user works in now, unless
     /// `LAYOUTS_REPO` names the repository; returns whether it moved.
     /// Everything read of the old one goes; an action running there
@@ -257,6 +313,7 @@ impl Git {
             root: Some(root),
             followed: project,
             writers: std::mem::take(&mut self.writers),
+            log_limit: self.log_limit,
             busy: self.busy.clone(),
             stale: self.stale.clone(),
             ..Self::default()
@@ -341,6 +398,7 @@ impl Git {
             self.branches = refs::branches(&repo);
             self.remote = refs::remote(&repo, &self.status.branch);
             self.stashes = refs::stashes(&repo);
+            self.read_log();
         }
         if !changed {
             return;
@@ -363,6 +421,9 @@ impl Git {
             "worktrees": worktrees, "branches": self.branches,
             "remote": self.remote, "stashes": self.stashes,
         });
+        if let (Some(_), Value::Object(fields)) = (self.log_limit, &mut out) {
+            fields.insert("log".to_owned(), Value::from(self.log.clone()));
+        }
         if let (Some(path), Value::Object(fields)) = (&self.diff_path, &mut out) {
             // Only a file git reports as changed: a path a mod makes up
             // (`../..`, `/etc/hosts`) would otherwise publish a file outside
@@ -388,40 +449,27 @@ impl Git {
         }
     }
 
-    /// Runs `action` on a thread of its own and answers `from` when it ends,
-    /// if `asked` names the repository it watches.
-    fn act(
+    /// [`act`](Self::act), or the reason `job` could not even be read.
+    fn act_or_refuse(
         &self,
         host: &Handle,
         from: &str,
         id: Option<&Data>,
         asked: Option<&str>,
-        action: Action,
+        job: Result<Job, String>,
+        name: &'static str,
     ) {
-        let name = match action {
-            Action::Commit(_) => "commit",
-            Action::Push => "push",
-            Action::CreatePullRequest => "pull_request",
-        };
-        let reply = id.cloned().unwrap_or_else(|| Data::from(name));
-        let answer = {
-            let (host, from, reply) = (host.clone(), from.to_owned(), reply.clone());
-            move |result: Result<String, String>| {
-                let (key, text) = match &result {
-                    Ok(message) => ("message", message.clone()),
-                    Err(error) => ("error", error.clone()),
-                };
-                host.send(
-                    &from,
-                    Data::Map(BTreeMap::from([
-                        ("reply".to_owned(), reply.clone()),
-                        ("action".to_owned(), Data::from(name)),
-                        ("ok".to_owned(), Data::Bool(result.is_ok())),
-                        (key.to_owned(), Data::String(text)),
-                    ])),
-                );
-            }
-        };
+        match job {
+            Ok(job) => self.act(host, from, id, asked, job),
+            Err(problem) => answerer(host, from, id, name)(Err(problem)),
+        }
+    }
+
+    /// Runs `job` on a thread of its own and answers `from` when it ends,
+    /// if `asked` names the repository it watches.
+    fn act(&self, host: &Handle, from: &str, id: Option<&Data>, asked: Option<&str>, job: Job) {
+        let name = job.name();
+        let answer = answerer(host, from, id, name);
         // A write changes the user's history and remote; a mod from
         // elsewhere must not do it unasked.
         if !self.writers.allows(from) {
@@ -453,13 +501,65 @@ impl Git {
         let spawned = thread::Builder::new()
             .name(format!("git-{name}"))
             .spawn(move || {
-                answer(run(input, action));
+                answer(job.run(input, &root));
                 busy.store(false, Ordering::Release);
                 stale.store(true, Ordering::Release);
             });
         if spawned.is_err() {
             self.busy.store(false, Ordering::Release);
         }
+    }
+}
+
+/// A write a mod asks for.
+enum Job {
+    Vcs(Action),
+    Worktree(Change),
+}
+
+impl Job {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Vcs(Action::Commit(_)) => "commit",
+            Self::Vcs(Action::Push) => "push",
+            Self::Vcs(Action::CreatePullRequest) => "pull_request",
+            Self::Worktree(Change::Add { .. }) => "worktree_add",
+            Self::Worktree(Change::Remove { .. }) => "worktree_remove",
+        }
+    }
+
+    fn run(self, input: Input, root: &Path) -> Result<String, String> {
+        match self {
+            Self::Vcs(action) => run(input, action),
+            Self::Worktree(change) => change.apply(root),
+        }
+    }
+}
+
+/// What answers `from` once a write named `name` ends: `id`, or the name
+/// when it gave none, comes back as `reply`.
+fn answerer(
+    host: &Handle,
+    from: &str,
+    id: Option<&Data>,
+    name: &'static str,
+) -> impl FnOnce(Result<String, String>) + Send + use<> {
+    let reply = id.cloned().unwrap_or_else(|| Data::from(name));
+    let (host, from) = (host.clone(), from.to_owned());
+    move |result: Result<String, String>| {
+        let (key, text) = match &result {
+            Ok(message) => ("message", message.clone()),
+            Err(error) => ("error", error.clone()),
+        };
+        host.send(
+            &from,
+            Data::Map(BTreeMap::from([
+                ("reply".to_owned(), reply),
+                ("action".to_owned(), Data::from(name)),
+                ("ok".to_owned(), Data::Bool(result.is_ok())),
+                (key.to_owned(), Data::String(text)),
+            ])),
+        );
     }
 }
 
@@ -514,8 +614,8 @@ fn base(repo: &Repo) -> String {
 }
 
 /// The repository to watch: `LAYOUTS_REPO`, else the project the user
-/// works in, else the one holding the app folder this provider is in (two
-/// folders up), as git.sh did.
+/// works in, else the one the app was started in, else the one holding the
+/// app folder this provider is in (two folders up), as git.sh did.
 fn repository(dir: &Path) -> Option<PathBuf> {
     if let Some(named) = std::env::var_os("LAYOUTS_REPO") {
         return toplevel(Path::new(&named));
@@ -523,6 +623,9 @@ fn repository(dir: &Path) -> Option<PathBuf> {
     moonframe_providers::project()
         .as_deref()
         .and_then(toplevel)
+        // Before any terminal has made a project: an app that opens its
+        // terminals from what git lists needs one to start from.
+        .or_else(|| moonframe_providers::launch_dir().and_then(toplevel))
         .or_else(|| toplevel(&dir.join("..").join("..")))
 }
 

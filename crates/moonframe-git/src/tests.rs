@@ -346,6 +346,92 @@ fn only_writers_may_commit() {
     assert_eq!(published(&seen)["changed"], 1, "nothing was committed");
 }
 
+/// Worktrees are writes: a mod outside `writers` is refused, and one inside
+/// hears where the worktree went.
+#[test]
+fn only_writers_may_change_worktrees() {
+    let dir = repository();
+    let (events, seen) = events();
+    let folder = dir.path().join("providers").join("git");
+    std::fs::create_dir_all(&folder).unwrap();
+    let host = Handle::new("git", &folder, writers(&["status"]), events);
+    let mut git = Git::default();
+    git.start(&host).unwrap();
+    let root = published(&seen)["root"].as_str().unwrap().to_owned();
+    let ask = |git: &mut Git, from: &str| {
+        let branch = Data::Map(BTreeMap::from([("branch".to_owned(), Data::from("side"))]));
+        let message = BTreeMap::from([
+            ("worktree_add".to_owned(), branch),
+            ("root".to_owned(), Data::from(root.as_str())),
+        ]);
+        git.receive(&host, from, Data::Map(message));
+    };
+    let reply_to = |name: &str| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            let reply = seen.lock().unwrap().iter().find_map(|event| match event {
+                Event::Sent { to, msg, .. } if to == name => {
+                    Some(moonframe_providers::to_json(msg))
+                },
+                _ => None,
+            });
+            if let Some(reply) = reply {
+                return reply;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("no reply to {name}");
+    };
+
+    ask(&mut git, "stranger");
+    let refused = reply_to("stranger");
+    assert_eq!(refused["ok"], false);
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("may not worktree_add"),
+        "{refused}"
+    );
+
+    ask(&mut git, "status");
+    let added = reply_to("status");
+    assert_eq!(added["ok"], true, "{added}");
+    assert_eq!(added["action"], "worktree_add");
+    let path = PathBuf::from(added["message"].as_str().unwrap());
+    assert!(path.join("a.txt").is_file());
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+/// A mod asking for the log each frame costs no more than the refs' own
+/// pace: past those reads, only a new request reads it.
+#[test]
+fn asking_for_the_same_log_again_reads_nothing() {
+    let dir = repository();
+    let (events, seen) = events();
+    let folder = dir.path().join("providers").join("git");
+    std::fs::create_dir_all(&folder).unwrap();
+    let host = Handle::new("git", &folder, writers(&[]), events);
+    let mut git = Git::default();
+    git.start(&host).unwrap();
+    let ask = |git: &mut Git, count: i64| {
+        let message = BTreeMap::from([("log".to_owned(), Data::Integer(count))]);
+        git.receive(&host, "history", Data::Map(message));
+    };
+    // Reads beyond those of the refs, however slow the machine is.
+    let extra = |git: &Git| git.log_reads as i64 - git.ref_reads as i64;
+
+    ask(&mut git, 10);
+    assert_eq!(published(&seen)["log"][0]["subject"], "first");
+    let asked = extra(&git);
+    for _ in 0..20 {
+        ask(&mut git, 10);
+    }
+    assert!(extra(&git) <= asked, "the same request read the log again");
+    ask(&mut git, 20);
+    assert_eq!(extra(&git), asked + 1, "a new request reads it at once");
+}
+
 /// A diff only covers files git lists as changed, never a path from
 /// outside the repository.
 #[test]
